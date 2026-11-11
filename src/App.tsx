@@ -182,25 +182,36 @@ export default function App() {
       });
       
       const contentType = res.headers.get('content-type');
-      if (!contentType || !contentType.includes('application/json')) {
-        throw new Error('Analysis server returned unexpected non-JSON response. Please retry.');
+      if (res.ok && contentType && contentType.includes('application/json')) {
+        const data = await res.json();
+        setSummary(data.summary);
+        setTimeSeriesData(data.timeSeriesData);
+        setForecastedVol(data.forecastedVol);
+        setFactorLoadings(data.factorLoadings);
+        setExplainedVariance(data.explainedVarianceRatio);
+        setRawRows(data.rawProcessedRows);
+        setLoading(false);
+
+        generateInstitutionalReport(data.summary, data.factorLoadings, data.forecastedVol);
+        return;
       }
+    } catch (err: any) {
+      // API unreachable or static GitHub Pages host fallback
+    }
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Server analysis failed.');
-
-      setSummary(data.summary);
-      setTimeSeriesData(data.timeSeriesData);
-      setForecastedVol(data.forecastedVol);
-      setFactorLoadings(data.factorLoadings);
-      setExplainedVariance(data.explainedVarianceRatio);
-      setRawRows(data.rawProcessedRows);
+    try {
+      const clientData = runClientQuantitativePipeline(rows);
+      setSummary(clientData.summary);
+      setTimeSeriesData(clientData.timeSeriesData);
+      setForecastedVol(clientData.forecastedVol);
+      setFactorLoadings(clientData.factorLoadings);
+      setExplainedVariance(clientData.explainedVarianceRatio);
+      setRawRows(clientData.rawProcessedRows);
       setLoading(false);
 
-      // Trigger background report generation
-      generateInstitutionalReport(data.summary, data.factorLoadings, data.forecastedVol);
-    } catch (err: any) {
-      setError(err.message || 'Data processing error');
+      generateInstitutionalReport(clientData.summary, clientData.factorLoadings, clientData.forecastedVol);
+    } catch (clientErr: any) {
+      setError(clientErr.message || 'Data processing failed');
       setLoading(false);
     }
   };
@@ -830,4 +841,337 @@ ${(forecastedVol || []).map((f) => `| Day ${f.day} | ${f.date} | ${(f.volatility
 - **Options Volatility Trading**: Given the EGARCH leverage parameter gamma < 0, downside put options exhibit high volatility skew. Utilize delta-neutral collar strategies or vertical put spreads to hedge against asymmetric downside shocks.
 - **Sentiment Mean Reversion**: Monitor rapid divergence between price log-returns and the PC1 Sentiment Index. Divergences greater than 2 standard deviations offer statistical arbitrage entry points.
 `;
+}
+
+function parseNum(val: any): number {
+  if (typeof val === 'number') return isNaN(val) ? 0 : val;
+  if (!val) return 0;
+  const cleaned = String(val).replace(/[,$\s%]/g, '');
+  const parsed = parseFloat(cleaned);
+  return isNaN(parsed) ? 0 : parsed;
+}
+
+function parseDate(val: any): string {
+  if (!val) return new Date().toISOString().split('T')[0];
+  if (typeof val === 'number') {
+    const dateObj = XLSX.SSF.parse_date_code(val);
+    if (dateObj) {
+      const d = new Date(Date.UTC(dateObj.y, dateObj.m - 1, dateObj.d));
+      return d.toISOString().split('T')[0];
+    }
+  }
+  const str = String(val).trim();
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) {
+    return d.toISOString().split('T')[0];
+  }
+  return str.substring(0, 10);
+}
+
+function runClientQuantitativePipeline(rows: any[]) {
+  if (!rows || rows.length < 10) {
+    throw new Error('Insufficient data points. Please provide at least 10 rows of financial data.');
+  }
+
+  const marketRows = rows.map((r: any) => ({
+    date: parseDate(r.date || r.Date || r.TIMESTAMP || r.Time || r.Day),
+    open: parseNum(r.open ?? r.Open ?? r.OPEN ?? 0),
+    high: parseNum(r.high ?? r.High ?? r.HIGH ?? 0),
+    low: parseNum(r.low ?? r.Low ?? r.LOW ?? 0),
+    close: parseNum(r.close ?? r.Close ?? r.CLOSE ?? r.Price ?? 100),
+    turnover: parseNum(r.turnover ?? r.Turnover ?? r.TURNOVER ?? r.Volume ?? r.VOL ?? 1000000),
+    pe: parseNum(r.pe ?? r.PE ?? r.P_E ?? r.PriceEarnings ?? 20),
+    pb: parseNum(r.pb ?? r.PB ?? r.P_B ?? r.PriceBook ?? 2.5),
+    divYield: parseNum(r.divYield ?? r.DivYield ?? r.DividendYield ?? r.DY ?? 2.0),
+  }));
+
+  const sorted = [...marketRows].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  const dates = sorted.map((r) => r.date);
+  const n = sorted.length;
+
+  const open = sorted.map((r) => r.open);
+  const high = sorted.map((r) => r.high);
+  const low = sorted.map((r) => r.low);
+  const close = sorted.map((r) => r.close);
+  const turnover = sorted.map((r) => r.turnover);
+  const pe = sorted.map((r) => r.pe);
+  const pb = sorted.map((r) => r.pb);
+  const divYield = sorted.map((r) => r.divYield);
+
+  const calcLogReturns = (arr: number[]) => {
+    const res: number[] = [0];
+    for (let i = 1; i < arr.length; i++) {
+      const prev = arr[i - 1] <= 0 ? 0.0001 : arr[i - 1];
+      const curr = arr[i] <= 0 ? 0.0001 : arr[i];
+      res.push(Math.log(curr / prev));
+    }
+    return res;
+  };
+
+  const retOpen = calcLogReturns(open);
+  const retHigh = calcLogReturns(high);
+  const retLow = calcLogReturns(low);
+  const retClose = calcLogReturns(close);
+  const retTurnover = calcLogReturns(turnover);
+  const retPe = calcLogReturns(pe);
+  const retPb = calcLogReturns(pb);
+  const retDivYield = calcLogReturns(divYield);
+
+  const featureNames = [
+    'Log Return (Open)',
+    'Log Return (High)',
+    'Log Return (Low)',
+    'Log Return (Close)',
+    'Log Return (Turnover)',
+    'Log Return (P/E)',
+    'Log Return (P/B)',
+    'Log Return (Div Yield)',
+  ];
+  const rawFeatures = [retOpen, retHigh, retLow, retClose, retTurnover, retPe, retPb, retDivYield];
+
+  const effectiveDates = dates.slice(1);
+  const T = effectiveDates.length;
+  const numCols = rawFeatures.length;
+  const trimmedFeatures = rawFeatures.map((col) => col.slice(1));
+
+  const standardizedFeatures: number[][] = [];
+  for (let j = 0; j < numCols; j++) {
+    const colData = trimmedFeatures[j];
+    const mean = colData.reduce((a, b) => a + b, 0) / colData.length;
+    const variance = colData.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (colData.length - 1);
+    const std = Math.sqrt(variance) || 0.0001;
+    standardizedFeatures.push(colData.map((val) => (val - mean) / std));
+  }
+
+  const covMatrix: number[][] = [];
+  for (let j1 = 0; j1 < numCols; j1++) {
+    const row: number[] = [];
+    for (let j2 = 0; j2 < numCols; j2++) {
+      const col1 = standardizedFeatures[j1];
+      const col2 = standardizedFeatures[j2];
+      const cov = col1.reduce((acc, v, idx) => acc + v * col2[idx], 0) / col1.length;
+      row.push(cov);
+    }
+    covMatrix.push(row);
+  }
+
+  const { eigenvalues, eigenvectors } = jacobiClientEigenDecomposition(covMatrix);
+  const eigenPairs = eigenvalues.map((val, idx) => ({
+    val,
+    vec: eigenvectors.map((row) => row[idx]),
+  }));
+  eigenPairs.sort((a, b) => b.val - a.val);
+
+  const sortedEigenvalues = eigenPairs.map((p) => Math.max(0, p.val));
+  const totalVariance = sortedEigenvalues.reduce((sum, v) => sum + v, 0) || 0.0001;
+  const explainedVarianceRatio = sortedEigenvalues.map((v) => (v / totalVariance) * 100);
+  const pc1Weights = eigenPairs[0].vec;
+
+  const sentimentIndexRaw: number[] = [];
+  for (let i = 0; i < T; i++) {
+    let score = 0;
+    for (let j = 0; j < numCols; j++) {
+      score += standardizedFeatures[j][i] * pc1Weights[j];
+    }
+    sentimentIndexRaw.push(score);
+  }
+
+  const sentMean = sentimentIndexRaw.reduce((a, b) => a + b, 0) / T;
+  const sentVar = sentimentIndexRaw.reduce((a, b) => a + Math.pow(b - sentMean, 2), 0) / (T - 1);
+  const sentStd = Math.sqrt(sentVar) || 1;
+  const sentimentIndex = sentimentIndexRaw.map((v) => 50 + 15 * ((v - sentMean) / sentStd));
+
+  const sentReturns = [0];
+  for (let i = 1; i < sentimentIndex.length; i++) {
+    sentReturns.push(sentimentIndex[i] - sentimentIndex[i - 1]);
+  }
+
+  const omega = -0.1;
+  const alpha = 0.15;
+  const gamma = -0.08;
+  const beta = 0.85;
+
+  const condVol: number[] = [];
+  const retMean = sentReturns.reduce((a, b) => a + b, 0) / sentReturns.length;
+  const retVar = sentReturns.reduce((a, b) => a + Math.pow(b - retMean, 2), 0) / (sentReturns.length - 1);
+  let currentLogVar = Math.log(retVar > 0 ? retVar : 1);
+  const sqrt2overPi = Math.sqrt(2 / Math.PI);
+  const residuals: number[] = [];
+
+  for (let i = 0; i < sentReturns.length; i++) {
+    const eps = sentReturns[i];
+    residuals.push(eps);
+    if (i === 0) {
+      condVol.push(Math.exp(currentLogVar / 2));
+      continue;
+    }
+    const prevEps = residuals[i - 1];
+    const prevSigma = condVol[i - 1] || 1;
+    const zPrev = prevEps / prevSigma;
+    const standardizedAbs = Math.abs(zPrev) - sqrt2overPi;
+
+    currentLogVar = omega + alpha * standardizedAbs + gamma * zPrev + beta * currentLogVar;
+    currentLogVar = Math.max(-10, Math.min(10, currentLogVar));
+    const sigmaT = Math.sqrt(Math.exp(currentLogVar));
+    condVol.push(isNaN(sigmaT) ? 1 : sigmaT);
+  }
+
+  const forecastDays = 10;
+  const forecastedVol: ForecastPoint[] = [];
+  let lastLogVar = currentLogVar;
+  const lastDateObj = new Date(effectiveDates[effectiveDates.length - 1]);
+
+  for (let d = 1; d <= forecastDays; d++) {
+    lastLogVar = omega + beta * (lastLogVar - omega);
+    const fVol = Math.sqrt(Math.exp(lastLogVar));
+    const nextDate = new Date(lastDateObj);
+    nextDate.setDate(nextDate.getDate() + d);
+    const dateStr = nextDate.toISOString().split('T')[0];
+    const margin = fVol * 0.25 * Math.sqrt(d);
+
+    forecastedVol.push({
+      day: d,
+      date: dateStr,
+      volatility: parseFloat(fVol.toFixed(4)),
+      upperConfidence: parseFloat((fVol + margin).toFixed(4)),
+      lowerConfidence: parseFloat(Math.max(0.01, fVol - margin).toFixed(4)),
+    });
+  }
+
+  const closePrices = sorted.map((r) => r.close);
+  const portfolioReturns = retClose.slice(1);
+  const meanReturn = portfolioReturns.reduce((a, b) => a + b, 0) / portfolioReturns.length;
+  const stdReturn = Math.sqrt(portfolioReturns.reduce((a, b) => a + Math.pow(b - meanReturn, 2), 0) / (portfolioReturns.length - 1)) || 0.01;
+  const annualizedSharpe = stdReturn > 0 ? (meanReturn * Math.sqrt(252)) / (stdReturn * Math.sqrt(252)) : 0;
+
+  let peak = closePrices[0];
+  let maxDD = 0;
+  for (const price of closePrices) {
+    if (price > peak) peak = price;
+    const dd = (peak - price) / peak;
+    if (dd > maxDD) maxDD = dd;
+  }
+
+  const sortedReturns = [...portfolioReturns].sort((a, b) => a - b);
+  const var95Idx = Math.floor(0.05 * sortedReturns.length);
+  const var95 = sortedReturns[var95Idx] || -0.02;
+
+  const timeSeriesData = effectiveDates.map((date, idx) => ({
+    date,
+    sentimentIndex: parseFloat(sentimentIndex[idx].toFixed(2)),
+    close: sorted[idx + 1].close,
+    turnover: sorted[idx + 1].turnover,
+    pe: sorted[idx + 1].pe,
+    volatility: parseFloat((condVol[idx] || 0.01).toFixed(4)),
+  }));
+
+  const factorLoadings = featureNames.map((name, idx) => ({
+    feature: name,
+    loading: parseFloat(pc1Weights[idx].toFixed(4)),
+    absLoading: parseFloat(Math.abs(pc1Weights[idx]).toFixed(4)),
+  }));
+
+  return {
+    summary: {
+      totalDataPoints: n,
+      startDate: effectiveDates[0],
+      endDate: effectiveDates[effectiveDates.length - 1],
+      currentSentiment: parseFloat((sentimentIndex[sentimentIndex.length - 1] || 50).toFixed(2)),
+      sentimentRegime: sentimentIndex[sentimentIndex.length - 1] > 55 ? 'Bullish Optimism' : sentimentIndex[sentimentIndex.length - 1] < 45 ? 'Bearish Pessimism' : 'Neutral Consolidation',
+      currentForecastVol: forecastedVol[0].volatility,
+      tenDayForecastVol: forecastedVol[forecastedVol.length - 1].volatility,
+      annualizedSharpe: parseFloat(annualizedSharpe.toFixed(2)),
+      maxDrawdown: parseFloat((maxDD * 100).toFixed(2)),
+      var95: parseFloat((Math.abs(var95) * 100).toFixed(2)),
+      pc1VarianceExplained: parseFloat(explainedVarianceRatio[0].toFixed(2)),
+    },
+    timeSeriesData,
+    forecastedVol,
+    factorLoadings,
+    explainedVarianceRatio: explainedVarianceRatio.map((v, i) => ({
+      component: `PC${i + 1}`,
+      variancePercent: parseFloat(v.toFixed(2)),
+      eigenvalue: parseFloat(sortedEigenvalues[i].toFixed(4)),
+    })),
+    rawProcessedRows: sorted.map((r, i) => ({
+      date: r.date,
+      open: r.open,
+      high: r.high,
+      low: r.low,
+      close: r.close,
+      turnover: r.turnover,
+      pe: r.pe,
+      pb: r.pb,
+      divYield: r.divYield,
+      sentimentScore: i > 0 ? parseFloat((sentimentIndex[i - 1] || 50).toFixed(2)) : 50,
+    })),
+  };
+}
+
+function jacobiClientEigenDecomposition(A: number[][], maxIter = 100, tol = 1e-9) {
+  const n = A.length;
+  let V: number[][] = [];
+  for (let i = 0; i < n; i++) {
+    const row = new Array(n).fill(0);
+    row[i] = 1;
+    V.push(row);
+  }
+  let D = A.map((row) => [...row]);
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    let maxOffDiag = 0;
+    let p = 0;
+    let q = 1;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (Math.abs(D[i][j]) > maxOffDiag) {
+          maxOffDiag = Math.abs(D[i][j]);
+          p = i;
+          q = j;
+        }
+      }
+    }
+
+    if (maxOffDiag < tol) break;
+
+    const diff = D[q][q] - D[p][p];
+    let t: number;
+    if (Math.abs(D[p][q]) < 1e-15 * Math.abs(diff)) {
+      t = D[p][q] / diff;
+    } else {
+      const phi = diff / (2.0 * D[p][q]);
+      t = 1.0 / (Math.abs(phi) + Math.sqrt(phi * phi + 1.0));
+      if (phi < 0) t = -t;
+    }
+
+    const c = 1.0 / Math.sqrt(t * t + 1.0);
+    const s = t * c;
+    const tau = s / (1.0 + c);
+
+    const temp = D[p][q];
+    D[p][q] = 0.0;
+    D[p][p] -= t * temp;
+    D[q][q] += t * temp;
+
+    for (let i = 0; i < n; i++) {
+      if (i !== p && i !== q) {
+        const g = D[i][p];
+        const h = D[i][q];
+        D[i][p] = g - s * (h + g * tau);
+        D[i][q] = h + s * (g - h * tau);
+        D[p][i] = D[i][p];
+        D[q][i] = D[i][q];
+      }
+    }
+
+    for (let i = 0; i < n; i++) {
+      const g = V[i][p];
+      const h = V[i][q];
+      V[i][p] = g - s * (h + g * tau);
+      V[i][q] = h + s * (g - h * tau);
+    }
+  }
+
+  const eigenvalues = D.map((row, i) => row[i]);
+  return { eigenvalues, eigenvectors: V };
 }
