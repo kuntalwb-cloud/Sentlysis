@@ -2,5 +2,7 @@
   "name": "QuantSentinel PCA Market Sentiment & EGARCH Volatility Forecaster",
   "description": "Advanced quantitative market sentiment index generation using PCA, AR(2)-EGARCH(1,1) volatility forecasting, and institutional research reporting.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
